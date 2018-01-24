@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/go-redis/redis"
 	"github.com/influxdata/telegraf"
@@ -14,24 +13,8 @@ import (
 )
 
 type Resque struct {
-	ResqueRedis string
-
-	client      *RedisClient
-	initialized bool
-}
-
-type RedisClient struct {
+	Redis  string
 	client *redis.Client
-	tags   map[string]string
-}
-
-
-func (r *RedisClient) BaseTags() map[string]string {
-	tags := make(map[string]string)
-	for k, v := range r.tags {
-		tags[k] = v
-	}
-	return tags
 }
 
 var sampleConfig = `
@@ -45,38 +28,33 @@ var sampleConfig = `
   ## If no server is specified, then localhost is used as the host.
   ## If no port is specified, 6379 is used
   ## If db is not specified, 1 is used
-  resque_redis = "tcp://localhost:6379/1"]
+  redis = "tcp://localhost:6379/1"
 `
 
+// SampleConfig will populate the sample configuration portion of the plugin's configuration
 func (r *Resque) SampleConfig() string {
 	return sampleConfig
 }
 
+// Description will appear directly above the plugin definition in the config file
 func (r *Resque) Description() string {
 	return "Read metrics from resque redis servers"
 }
 
-var Tracking = map[string]string{
-	"backlog": "backlog",
-}
-
-func (r *Resque) init(acc telegraf.Accumulator) error {
-	if r.initialized {
-		return nil
+// Gather defines what data the plugin will gather.
+func (r *Resque) Gather(acc telegraf.Accumulator) error {
+	if r.Redis == "" {
+		r.Redis = "tcp://localhost:6379/1"
 	}
 
-	if r.ResqueRedis == "" {
-		r.ResqueRedis = "tcp://localhost:6379/1"
-	}
-
-	if !strings.HasPrefix(r.ResqueRedis, "tcp://") && !strings.HasPrefix(r.ResqueRedis, "unix://") {
+	if !strings.HasPrefix(r.Redis, "tcp://") && !strings.HasPrefix(r.Redis, "unix://") {
 		log.Printf("W! [inputs.resque]: server URL found without scheme; please update your configuration file")
-		r.ResqueRedis = "tcp://" + r.ResqueRedis
+		r.Redis = "tcp://" + r.Redis
 	}
 
-	u, err := url.Parse(r.ResqueRedis)
+	u, err := url.Parse(r.Redis)
 	if err != nil {
-		return fmt.Errorf("Unable to parse to address %q: %v", r.Server, err)
+		return fmt.Errorf("Unable to parse to address %q: %v", r.Redis, err)
 	}
 
 	password := ""
@@ -96,7 +74,8 @@ func (r *Resque) init(acc telegraf.Accumulator) error {
 
 	var db int
 	if u.Path != "" {
-		db, err = strconv.Atoi(u.Path)
+		db, err = strconv.Atoi(strings.TrimPrefix(u.Path,"/"))
+
 		if err != nil {
 			log.Printf("W! [inputs.resque]: redis db is not a number; please update your configuration file")
 		}
@@ -104,79 +83,88 @@ func (r *Resque) init(acc telegraf.Accumulator) error {
 		db = 1
 	}
 
-	client := redis.NewClient(
+	r.client = redis.NewClient(
 		&redis.Options{
 			Addr:     address,
 			Password: password,
 			Network:  u.Scheme,
-			PoolSize: 1,
 			DB:       db,
 		},
 	)
 
-	tags := map[string]string{}
-	if u.Scheme == "unix" {
-		tags["socket"] = u.Path
-	} else {
-		tags["server"] = u.Hostname()
-		tags["port"] = u.Port()
-	}
-
-
-	r.client= &RedisClient{
-		client: client,
-		tags:   tags,
-	}
-
-
-	r.initialized = true
-	return nil
-}
-
-// Reads stats from configured resque redis accumulates stats.
-// Returns one of the errors encountered while gather stats (if any).
-func (r *Resque) Gather(acc telegraf.Accumulator) error {
-	if !r.initialized {
-		err := r.init(acc)
-		if err != nil {
-			return err
-		}
-	}
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		acc.AddError(r.gatherBacklog(acc))
-	}()
-
-	wg.Wait()
-	return nil
-}
-
-func (r *Resque) gatherBacklog(acc telegraf.Accumulator) error {
-	queues, err := r.client.client.SMembers("resque:queues").Result()
+	queues, err := r.client.SMembers("resque:queues").Result()
 	if err != nil {
 		return err
 	}
 
-	for _, queuename := range queues {
-		queueKey := "resque:queue:" + queuename
-		fmt.Println(queueKey)
-		queueBackLog, err := r.client.client.LLen(queueKey).Result()
+	queuesInfo := make(map[string]map[string]interface{})
+
+	for _, queueName := range queues {
+		queueKey := "resque:queue:" + queueName
+
+		queueBackLog, err := r.client.LLen(queueKey).Result()
 		if err != nil {
 			return err
 		}
+		queuesInfo[queueName] = make(map[string]interface{})
 
-		fields := map[string]interface{}{
-			"backlog": queueBackLog,
+		queuesInfo[queueName]["backlog"] = queueBackLog
+
+	}
+
+	workers, err := r.client.SMembers("resque:workers").Result()
+	if err != nil {
+		return err
+	}
+
+	workersPerQueue := make(map[string]int)
+
+	for _, worker := range workers {
+		workerQueues := strings.Split(worker, ":")[2]
+		workerQueuesList := strings.Split(workerQueues, ",")
+		for _, workerQueue := range workerQueuesList {
+			// handle workers listening to *
+			if strings.Contains(workerQueue, "*") {
+				// handle *
+				if workerQueue == "*" {
+					for _, queueName := range queues {
+						workersPerQueue[queueName] = workersPerQueue[queueName] + 1
+					}
+				} else {
+					// handle something*
+					for _, queueName := range queues {
+						if strings.HasPrefix(queueName, workerQueue) {
+							workersPerQueue[queueName] = workersPerQueue[queueName] + 1
+						}
+					}
+				}
+			} else {
+				workersPerQueue[workerQueue] = workersPerQueue[workerQueue] + 1
+			}
 		}
-		r.client.tags["queue"] = queuename
+	}
 
-		acc.AddFields("resque_backlog",fields, r.client.tags)
+	for queueName, workersCount := range workersPerQueue {
+		// handle worker without queue  in queues list
+		if queuesInfo[queueName] == nil {
+			queuesInfo[queueName] = make(map[string]interface{})
+			queuesInfo[queueName]["backlog"] = 0
+		}
+		queuesInfo[queueName]["workers"] = workersCount
+	}
 
-		fmt.Printf("%s  - %d", queuename, queueBackLog)
+	queueInfo := make(map[string]interface{})
+
+	var queueName string
+
+	for queueName, queueInfo = range queuesInfo {
+
+		tags := map[string]string{
+			"queue": queueName,
+		}
+
+		acc.AddFields("resque", queueInfo, tags)
+
 	}
 
 	return err
