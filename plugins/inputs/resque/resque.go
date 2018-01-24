@@ -1,15 +1,12 @@
 package resque
 
 import (
-	"fmt"
-	"log"
-	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/go-redis/redis"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	"fmt"
 )
 
 type Resque struct {
@@ -21,14 +18,12 @@ var sampleConfig = `
   ## specify resque redis via a url matching:
   ##  [protocol://][:password]@address[:port]/db
   ##  e.g.
-  ##    tcp://localhost:6379/1
-  ##    tcp://:password@192.168.99.100/2
-  ##    unix:///var/run/redis.sock/3
+  ##    redis://localhost:6379/1
+  ##    redis://:password@192.168.99.100/2
   ##
   ## If no server is specified, then localhost is used as the host.
   ## If no port is specified, 6379 is used
-  ## If db is not specified, 1 is used
-  redis = "tcp://localhost:6379/1"
+  ## If db is not specified, 0 is used
 `
 
 // SampleConfig will populate the sample configuration portion of the plugin's configuration
@@ -44,53 +39,15 @@ func (r *Resque) Description() string {
 // Gather defines what data the plugin will gather.
 func (r *Resque) Gather(acc telegraf.Accumulator) error {
 	if r.Redis == "" {
-		r.Redis = "tcp://localhost:6379/1"
+		r.Redis = "redis://"
 	}
 
-	if !strings.HasPrefix(r.Redis, "tcp://") && !strings.HasPrefix(r.Redis, "unix://") {
-		log.Printf("W! [inputs.resque]: server URL found without scheme; please update your configuration file")
-		r.Redis = "tcp://" + r.Redis
-	}
-
-	u, err := url.Parse(r.Redis)
+	redisClientOptions, err := redis.ParseURL(r.Redis)
 	if err != nil {
-		return fmt.Errorf("Unable to parse to address %q: %v", r.Redis, err)
+		return 	fmt.Errorf("W! [inputs.resque]: %s", err)
 	}
 
-	password := ""
-	if u.User != nil {
-		pw, ok := u.User.Password()
-		if ok {
-			password = pw
-		}
-	}
-
-	var address string
-	if u.Scheme == "unix" {
-		address = u.Path
-	} else {
-		address = u.Host
-	}
-
-	var db int
-	if u.Path != "" {
-		db, err = strconv.Atoi(strings.TrimPrefix(u.Path,"/"))
-
-		if err != nil {
-			log.Printf("W! [inputs.resque]: redis db is not a number; please update your configuration file")
-		}
-	} else {
-		db = 1
-	}
-
-	r.client = redis.NewClient(
-		&redis.Options{
-			Addr:     address,
-			Password: password,
-			Network:  u.Scheme,
-			DB:       db,
-		},
-	)
+	r.client = redis.NewClient(redisClientOptions)
 
 	queues, err := r.client.SMembers("resque:queues").Result()
 	if err != nil {
